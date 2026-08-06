@@ -3,7 +3,10 @@
 A minimal native C++ CLI utility for cloning physical disks on Windows while preserving
 bootability. Built exclusively on inbox Microsoft APIs — Win32 disk/volume IOCTLs, the
 Volume Shadow Copy Service (VSS) requester API, C++/WinRT for COM interop, and inbox
-`bcdboot.exe` for boot-configuration repair. No third-party dependencies.
+`bcdboot.exe` for boot-configuration repair. The only library dependency is
+[WIL](https://github.com/microsoft/wil) (Microsoft's header-only Windows Implementation
+Library, vendored as a submodule) — compile-time only, so the shipped binary still
+touches nothing but inbox Windows APIs.
 
 The central use case: clone your **running** system boot drive onto a bigger drive
 (HDD → SSD, small SSD → big SSD) and boot from the result.
@@ -114,9 +117,11 @@ winget install diskclone
 
 ## Building
 
-Visual Studio 2022 (v143) with the Windows SDK. No packages.
+Visual Studio 2022 (v143) with the Windows SDK. No packages — the single header-only
+dependency (WIL) comes in as a git submodule:
 
 ```
+git clone --recurse-submodules https://github.com/Spruill-1/DiskClone.git
 msbuild DiskClone.sln /p:Configuration=Release /p:Platform=x64
 msbuild DiskClone.sln /p:Configuration=Release /p:Platform=ARM64
 ```
