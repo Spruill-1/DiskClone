@@ -1,0 +1,51 @@
+name: Release
+
+# Tag a commit vX.Y.Z (matching src/version.h) to build both architectures,
+# package them with SHA-256 sums, and publish a GitHub release. These stable
+# per-version download URLs are what the future winget manifest will point at.
+
+on:
+  push:
+    tags: [ 'v*' ]
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout (with WIL submodule)
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Add MSBuild to PATH
+        uses: microsoft/setup-msbuild@v2
+
+      - name: Build x64
+        run: msbuild DiskClone.sln /m /warnaserror /p:Configuration=Release /p:Platform=x64
+
+      - name: Build ARM64
+        run: msbuild DiskClone.sln /m /warnaserror /p:Configuration=Release /p:Platform=ARM64
+
+      - name: Package
+        shell: powershell
+        run: |
+          $version = "${{ github.ref_name }}".TrimStart('v')
+          New-Item -ItemType Directory dist | Out-Null
+          Compress-Archive -Path x64\Release\diskclone.exe -DestinationPath "dist\diskclone-$version-x64.zip"
+          Compress-Archive -Path ARM64\Release\diskclone.exe -DestinationPath "dist\diskclone-$version-arm64.zip"
+          Get-ChildItem dist\*.zip | ForEach-Object {
+              "$((Get-FileHash $_.FullName -Algorithm SHA256).Hash.ToLower())  $($_.Name)"
+          } | Set-Content dist\SHA256SUMS.txt -Encoding ascii
+          Get-Content dist\SHA256SUMS.txt
+
+      - name: Create GitHub release
+        shell: powershell
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "${{ github.ref_name }}" dist\*.zip dist\SHA256SUMS.txt `
+            --title "diskclone ${{ github.ref_name }}" `
+            --generate-notes

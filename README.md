@@ -1,5 +1,7 @@
 # diskclone
 
+[![CI](https://github.com/Spruill-1/DiskClone/actions/workflows/ci.yml/badge.svg)](https://github.com/Spruill-1/DiskClone/actions/workflows/ci.yml)
+
 A minimal native C++ CLI utility for cloning physical disks on Windows while preserving
 bootability. Built exclusively on inbox Microsoft APIs — Win32 disk/volume IOCTLs, the
 Volume Shadow Copy Service (VSS) requester API, C++/WinRT for COM interop, and inbox

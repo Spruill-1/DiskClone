@@ -1,0 +1,53 @@
+name: CI
+
+on:
+  push:
+    branches: [ master, main ]
+  pull_request:
+
+jobs:
+  build:
+    name: ${{ matrix.platform }} ${{ matrix.configuration }}
+    runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        platform: [x64, ARM64]
+        configuration: [Debug, Release]
+
+    steps:
+      - name: Checkout (with WIL submodule)
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Add MSBuild to PATH
+        uses: microsoft/setup-msbuild@v2
+
+      - name: Build
+        run: msbuild DiskClone.sln /m /warnaserror /p:Configuration=${{ matrix.configuration }} /p:Platform=${{ matrix.platform }}
+
+      # The runner is x64, so only x64 binaries can execute here. ARM64 gets
+      # build coverage; its behavior is identical by construction (no
+      # architecture-specific code paths).
+      - name: Smoke test (--version, usage)
+        if: matrix.platform == 'x64'
+        shell: powershell
+        run: |
+          & ".\x64\${{ matrix.configuration }}\diskclone.exe" --version
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+
+      # Full end-to-end clone verification on scratch VHDX disks (GPT + MBR
+      # rounds). Runners execute elevated; the test needs only inbox diskpart
+      # and the Storage cmdlets — no Hyper-V.
+      - name: VHD clone test (GPT + MBR)
+        if: matrix.platform == 'x64' && matrix.configuration == 'Release'
+        shell: powershell
+        run: .\tests\vhd-test.ps1 -ExePath .\x64\Release\diskclone.exe
+
+      - name: Upload binary
+        if: matrix.configuration == 'Release'
+        uses: actions/upload-artifact@v4
+        with:
+          name: diskclone-${{ matrix.platform }}
+          path: ${{ matrix.platform }}/Release/diskclone.exe
