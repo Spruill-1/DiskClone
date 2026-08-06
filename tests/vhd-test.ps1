@@ -32,6 +32,23 @@ function Read-Sector0($diskNumber) {
     finally { $stream.Dispose() }
 }
 
+# Path formats in Get-Disk's Location vary across environments (8.3 segments,
+# casing), and disk arrival can lag the diskpart attach — so match virtual
+# disks by unique filename, case-insensitively, with a retry window.
+function Find-VhdDisk([string]$VhdPath) {
+    $leafName = Split-Path $VhdPath -Leaf
+    for ($attempt = 0; $attempt -lt 15; $attempt++) {
+        $disk = Get-Disk | Where-Object {
+            $_.BusType -eq 'File Backed Virtual' -and $_.Location -and
+            ((Split-Path $_.Location -Leaf) -ieq $leafName)
+        }
+        if ($disk) { return $disk }
+        Start-Sleep -Seconds 1
+    }
+
+    return $null
+}
+
 function Invoke-CloneRound([string]$Style) {
     Write-Output "===== ROUND: $Style ====="
     $sourceVhd = Join-Path $WorkDir "clonesrc-$Style.vhdx"
@@ -43,18 +60,21 @@ function Invoke-CloneRound([string]$Style) {
                 Remove-Item $vhd -Force -ErrorAction SilentlyContinue
             }
         }
-        @"
+        $diskpartOutput = @"
 create vdisk file="$sourceVhd" maximum=2048 type=expandable
 attach vdisk
 create vdisk file="$targetVhd" maximum=4096 type=expandable
 attach vdisk
-"@ | diskpart | Out-Null
-        Start-Sleep -Seconds 2
+"@ | diskpart
 
-        $sourceDisk = Get-Disk | Where-Object { $_.Location -eq $sourceVhd }
-        $targetDisk = Get-Disk | Where-Object { $_.Location -eq $targetVhd }
-        if (-not $sourceDisk -or -not $targetDisk) { throw "could not find attached VHD disks" }
-        if ($sourceDisk.BusType -ne 'File Backed Virtual' -or $targetDisk.BusType -ne 'File Backed Virtual') { throw "bus type mismatch - aborting" }
+        $sourceDisk = Find-VhdDisk $sourceVhd
+        $targetDisk = Find-VhdDisk $targetVhd
+        if (-not $sourceDisk -or -not $targetDisk) {
+            Write-Output "diskpart output was:"
+            $diskpartOutput | ForEach-Object { "  $_" }
+            Get-Disk | Format-Table Number, BusType, Size, Location -AutoSize | Out-String | Write-Output
+            throw "could not find attached VHD disks"
+        }
         if ([math]::Abs($sourceDisk.Size - 2GB) -gt 200MB -or [math]::Abs($targetDisk.Size - 4GB) -gt 200MB) { throw "size sanity check failed - aborting" }
         Write-Output "source disk: $($sourceDisk.Number)  target disk: $($targetDisk.Number)"
 
