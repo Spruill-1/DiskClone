@@ -20,6 +20,10 @@ param(
 $ErrorActionPreference = 'Stop'
 $ExePath = (Resolve-Path $ExePath).Path
 New-Item -ItemType Directory -Force $WorkDir | Out-Null
+
+# Expand 8.3 short-name segments (RUNNER~1 etc. — the default TEMP on GitHub
+# runners): mount-point APIs reject short paths as "not valid".
+$WorkDir = (New-Object -ComObject Scripting.FileSystemObject).GetFolder($WorkDir).Path
 $script:fail = $false
 
 function Check($name, $condition) {
@@ -159,10 +163,23 @@ attach vdisk
         $mountDir = Join-Path $WorkDir "mnt-$Style"
         New-Item -ItemType Directory -Force $mountDir | Out-Null
         $dataPartition = Get-Partition -DiskNumber $targetDisk.Number | Sort-Object Offset | Select-Object -Last 1
-        Add-PartitionAccessPath -DiskNumber $targetDisk.Number -PartitionNumber $dataPartition.PartitionNumber -AccessPath $mountDir
+        try {
+            Add-PartitionAccessPath -DiskNumber $targetDisk.Number -PartitionNumber $dataPartition.PartitionNumber -AccessPath $mountDir -ErrorAction Stop
+        } catch {
+            # Fallback: mount by volume GUID via inbox mountvol, which needs no
+            # Storage-cmdlet cooperation at all.
+            Write-Output "Add-PartitionAccessPath failed ($($_.Exception.Message)); trying mountvol"
+            $volumeGuidPath = @($dataPartition.AccessPaths) | Where-Object { $_ -like '\\?\Volume{*' } | Select-Object -First 1
+            if ($volumeGuidPath) { cmd /c "mountvol `"$mountDir`" $volumeGuidPath" | Out-Null }
+        }
+
         $mounted = Test-Path (Join-Path $mountDir 'data')
         Write-Output "clone mounted at: $mountDir"
         Check "[$Style] clone volume mounted" $mounted
+        if (-not $mounted) {
+            Write-Output "diagnostics: partition access paths: $($dataPartition.AccessPaths -join ', ')"
+            throw "mount failed"
+        }
 
         $targetHashes = Get-ChildItem (Join-Path $mountDir 'data') | Get-FileHash -Algorithm SHA256 | Sort-Object Path
         Check "[$Style] file count matches" (@($targetHashes).Count -eq @($sourceHashes).Count)
