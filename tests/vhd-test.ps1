@@ -150,13 +150,25 @@ attach vdisk
         Check "[$Style] data partition expanded" ($lastTarget.Size -gt $lastSource.Size)
         Write-Output "data partition: $([math]::Round($lastSource.Size/1MB))MB -> $([math]::Round($lastTarget.Size/1MB))MB"
 
-        $targetVolume = Get-Partition -DiskNumber $targetDisk.Number | Get-Volume | Where-Object FileSystemLabel -eq "SRC$Style"
-        if (-not $targetVolume.DriveLetter) {
-            $lastPartition = Get-Partition -DiskNumber $targetDisk.Number | Sort-Object Offset | Select-Object -Last 1
-            $lastPartition | Add-PartitionAccessPath -AssignDriveLetter
-            $targetVolume = Get-Partition -DiskNumber $targetDisk.Number | Get-Volume | Where-Object FileSystemLabel -eq "SRC$Style"
+        # Automount assigns the clone's drive letter asynchronously after the
+        # disk onlines; poll rather than race it, and only hand-assign a letter
+        # if the data partition demonstrably still has none after a grace
+        # period (assigning twice fails with "multiple drive letters").
+        $targetLetter = $null
+        for ($attempt = 0; $attempt -lt 30; $attempt++) {
+            $targetVolume = Get-Partition -DiskNumber $targetDisk.Number -ErrorAction SilentlyContinue |
+                Get-Volume -ErrorAction SilentlyContinue | Where-Object FileSystemLabel -eq "SRC$Style"
+            if ($targetVolume -and $targetVolume.DriveLetter) { $targetLetter = $targetVolume.DriveLetter; break }
+
+            if ($attempt -eq 10) {
+                $lastPartition = Get-Partition -DiskNumber $targetDisk.Number | Sort-Object Offset | Select-Object -Last 1
+                if (-not $lastPartition.DriveLetter) {
+                    try { $lastPartition | Add-PartitionAccessPath -AssignDriveLetter -ErrorAction Stop } catch { }
+                }
+            }
+
+            Start-Sleep -Seconds 1
         }
-        $targetLetter = $targetVolume.DriveLetter
         Write-Output "clone volume: ${targetLetter}:"
         Check "[$Style] clone volume mounted" ($null -ne $targetLetter)
 
