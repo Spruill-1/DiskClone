@@ -14,16 +14,20 @@
 
 param(
     [string]$ExePath = (Join-Path $PSScriptRoot '..\x64\Release\diskclone.exe'),
-    [string]$WorkDir = (Join-Path $env:TEMP 'diskclone-vhdtest')
+    [string]$WorkDir = $null
 )
 
 $ErrorActionPreference = 'Stop'
 $ExePath = (Resolve-Path $ExePath).Path
-New-Item -ItemType Directory -Force $WorkDir | Out-Null
 
-# Expand 8.3 short-name segments (RUNNER~1 etc. — the default TEMP on GitHub
-# runners): mount-point APIs reject short paths as "not valid".
-$WorkDir = (New-Object -ComObject Scripting.FileSystemObject).GetFolder($WorkDir).Path
+# Prefer RUNNER_TEMP on CI: the default TEMP there contains 8.3 short-name
+# segments (RUNNER~1), which mount-point APIs reject as "not valid".
+if (-not $WorkDir) {
+    $tempBase = if ($env:RUNNER_TEMP) { $env:RUNNER_TEMP } else { $env:TEMP }
+    $WorkDir = Join-Path $tempBase 'diskclone-vhdtest'
+}
+
+New-Item -ItemType Directory -Force $WorkDir | Out-Null
 $script:fail = $false
 
 function Check($name, $condition) {
@@ -159,41 +163,45 @@ attach vdisk
         # environments (letters arrive late or never on CI images), while an
         # explicit Add-PartitionAccessPath is deterministic. diskpart, chkdsk,
         # and Get-Volume -FilePath all accept mount-point paths directly.
+        # Whether automount assigns the clone's volume a drive letter is
+        # nondeterministic across environments and even across runs — so take
+        # whatever access path already exists, and only add a folder mount
+        # point when there is none.
         Update-HostStorageCache -ErrorAction SilentlyContinue
-        $mountDir = Join-Path $WorkDir "mnt-$Style"
-        New-Item -ItemType Directory -Force $mountDir | Out-Null
         $dataPartition = Get-Partition -DiskNumber $targetDisk.Number | Sort-Object Offset | Select-Object -Last 1
-        try {
-            Add-PartitionAccessPath -DiskNumber $targetDisk.Number -PartitionNumber $dataPartition.PartitionNumber -AccessPath $mountDir -ErrorAction Stop
-        } catch {
-            # Fallback: mount by volume GUID via inbox mountvol, which needs no
-            # Storage-cmdlet cooperation at all.
-            Write-Output "Add-PartitionAccessPath failed ($($_.Exception.Message)); trying mountvol"
-            $volumeGuidPath = @($dataPartition.AccessPaths) | Where-Object { $_ -like '\\?\Volume{*' } | Select-Object -First 1
-            if ($volumeGuidPath) { cmd /c "mountvol `"$mountDir`" $volumeGuidPath" | Out-Null }
+        $letterPath = @($dataPartition.AccessPaths) | Where-Object { $_ -match '^[A-Za-z]:\\$' } | Select-Object -First 1
+        if ($letterPath) {
+            $mountRoot = $letterPath.TrimEnd('\')                       # "F:"
+            $diskpartSelector = $mountRoot.Substring(0, 1)              # "F"
+        } else {
+            $mountDir = Join-Path $WorkDir "mnt-$Style"
+            New-Item -ItemType Directory -Force $mountDir | Out-Null
+            Add-PartitionAccessPath -DiskNumber $targetDisk.Number -PartitionNumber $dataPartition.PartitionNumber -AccessPath $mountDir
+            $mountRoot = $mountDir
+            $diskpartSelector = "`"$mountDir`""
         }
 
-        $mounted = Test-Path (Join-Path $mountDir 'data')
-        Write-Output "clone mounted at: $mountDir"
+        $mounted = Test-Path (Join-Path $mountRoot 'data')
+        Write-Output "clone mounted at: $mountRoot"
         Check "[$Style] clone volume mounted" $mounted
         if (-not $mounted) {
             Write-Output "diagnostics: partition access paths: $($dataPartition.AccessPaths -join ', ')"
             throw "mount failed"
         }
 
-        $targetHashes = Get-ChildItem (Join-Path $mountDir 'data') | Get-FileHash -Algorithm SHA256 | Sort-Object Path
+        $targetHashes = Get-ChildItem (Join-Path $mountRoot 'data') | Get-FileHash -Algorithm SHA256 | Sort-Object Path
         Check "[$Style] file count matches" (@($targetHashes).Count -eq @($sourceHashes).Count)
         for ($i = 0; $i -lt @($sourceHashes).Count; $i++) {
             Check "[$Style] hash file$($i+1)" (@($targetHashes)[$i].Hash -eq @($sourceHashes)[$i].Hash)
         }
 
-        $volumeSizeBefore = (Get-Volume -FilePath $mountDir).Size
-        "select volume `"$mountDir`"`nextend filesystem" | diskpart | Out-Null
-        $volumeSizeAfter = (Get-Volume -FilePath $mountDir).Size
+        $volumeSizeBefore = (Get-Volume -FilePath ($mountRoot + '\')).Size
+        "select volume $diskpartSelector`nextend filesystem" | diskpart | Out-Null
+        $volumeSizeAfter = (Get-Volume -FilePath ($mountRoot + '\')).Size
         Write-Output "volume size: $([math]::Round($volumeSizeBefore/1MB))MB -> $([math]::Round($volumeSizeAfter/1MB))MB"
         Check "[$Style] extend filesystem grew the volume" ($volumeSizeAfter -gt $volumeSizeBefore)
 
-        $chkdskOutput = cmd /c "chkdsk `"$mountDir`" /scan 2>&1"
+        $chkdskOutput = cmd /c "chkdsk $mountRoot /scan 2>&1"
         Check "[$Style] chkdsk found no problems" (($chkdskOutput -join ' ') -match 'found no problems')
     }
     catch {
