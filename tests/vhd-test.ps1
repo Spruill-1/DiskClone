@@ -150,41 +150,33 @@ attach vdisk
         Check "[$Style] data partition expanded" ($lastTarget.Size -gt $lastSource.Size)
         Write-Output "data partition: $([math]::Round($lastSource.Size/1MB))MB -> $([math]::Round($lastTarget.Size/1MB))MB"
 
-        # Automount assigns the clone's drive letter asynchronously after the
-        # disk onlines; poll rather than race it, and only hand-assign a letter
-        # if the data partition demonstrably still has none after a grace
-        # period (assigning twice fails with "multiple drive letters").
-        $targetLetter = $null
-        for ($attempt = 0; $attempt -lt 30; $attempt++) {
-            $targetVolume = Get-Partition -DiskNumber $targetDisk.Number -ErrorAction SilentlyContinue |
-                Get-Volume -ErrorAction SilentlyContinue | Where-Object FileSystemLabel -eq "SRC$Style"
-            if ($targetVolume -and $targetVolume.DriveLetter) { $targetLetter = $targetVolume.DriveLetter; break }
+        # Mount the clone's data partition at a folder mount point instead of
+        # relying on a drive letter — automount behavior varies wildly across
+        # environments (letters arrive late or never on CI images), while an
+        # explicit Add-PartitionAccessPath is deterministic. diskpart, chkdsk,
+        # and Get-Volume -FilePath all accept mount-point paths directly.
+        Update-HostStorageCache -ErrorAction SilentlyContinue
+        $mountDir = Join-Path $WorkDir "mnt-$Style"
+        New-Item -ItemType Directory -Force $mountDir | Out-Null
+        $dataPartition = Get-Partition -DiskNumber $targetDisk.Number | Sort-Object Offset | Select-Object -Last 1
+        Add-PartitionAccessPath -DiskNumber $targetDisk.Number -PartitionNumber $dataPartition.PartitionNumber -AccessPath $mountDir
+        $mounted = Test-Path (Join-Path $mountDir 'data')
+        Write-Output "clone mounted at: $mountDir"
+        Check "[$Style] clone volume mounted" $mounted
 
-            if ($attempt -eq 10) {
-                $lastPartition = Get-Partition -DiskNumber $targetDisk.Number | Sort-Object Offset | Select-Object -Last 1
-                if (-not $lastPartition.DriveLetter) {
-                    try { $lastPartition | Add-PartitionAccessPath -AssignDriveLetter -ErrorAction Stop } catch { }
-                }
-            }
-
-            Start-Sleep -Seconds 1
-        }
-        Write-Output "clone volume: ${targetLetter}:"
-        Check "[$Style] clone volume mounted" ($null -ne $targetLetter)
-
-        $targetHashes = Get-ChildItem "${targetLetter}:\data" | Get-FileHash -Algorithm SHA256 | Sort-Object Path
+        $targetHashes = Get-ChildItem (Join-Path $mountDir 'data') | Get-FileHash -Algorithm SHA256 | Sort-Object Path
         Check "[$Style] file count matches" (@($targetHashes).Count -eq @($sourceHashes).Count)
         for ($i = 0; $i -lt @($sourceHashes).Count; $i++) {
             Check "[$Style] hash file$($i+1)" (@($targetHashes)[$i].Hash -eq @($sourceHashes)[$i].Hash)
         }
 
-        $volumeSizeBefore = (Get-Volume -DriveLetter $targetLetter).Size
-        "select volume $targetLetter`nextend filesystem" | diskpart | Out-Null
-        $volumeSizeAfter = (Get-Volume -DriveLetter $targetLetter).Size
+        $volumeSizeBefore = (Get-Volume -FilePath $mountDir).Size
+        "select volume `"$mountDir`"`nextend filesystem" | diskpart | Out-Null
+        $volumeSizeAfter = (Get-Volume -FilePath $mountDir).Size
         Write-Output "volume size: $([math]::Round($volumeSizeBefore/1MB))MB -> $([math]::Round($volumeSizeAfter/1MB))MB"
         Check "[$Style] extend filesystem grew the volume" ($volumeSizeAfter -gt $volumeSizeBefore)
 
-        $chkdskOutput = cmd /c "chkdsk ${targetLetter}: /scan 2>&1"
+        $chkdskOutput = cmd /c "chkdsk `"$mountDir`" /scan 2>&1"
         Check "[$Style] chkdsk found no problems" (($chkdskOutput -join ' ') -match 'found no problems')
     }
     catch {
@@ -196,6 +188,8 @@ attach vdisk
             try { "select vdisk file=`"$vhd`"`ndetach vdisk" | diskpart | Out-Null } catch { }
             try { Remove-Item $vhd -Force -ErrorAction SilentlyContinue } catch { }
         }
+
+        try { Remove-Item (Join-Path $WorkDir "mnt-$Style") -Force -Recurse -ErrorAction SilentlyContinue } catch { }
     }
 }
 
